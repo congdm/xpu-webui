@@ -31,7 +31,7 @@ def run_inference(
     if not prompt.strip():
         raise gr.Error("Please enter a prompt.")
     image = generate(
-        pipe=pipe,
+        components=pipe,
         prompt=prompt,
         negative_prompt=negative_prompt,
         width=width,
@@ -50,7 +50,7 @@ with gr.Blocks(title="Z-Image-Turbo · Intel XPU") as demo:
     gr.Markdown(
         """
         # 🖼️ Z-Image-Turbo · Intel XPU
-        **Model:** [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)  
+        **Model:** [Comfy-Org/z_image_turbo](https://huggingface.co/Comfy-Org/z_image_turbo)  
         **Device:** """ + device + """
         """
     )
@@ -70,18 +70,18 @@ with gr.Blocks(title="Z-Image-Turbo · Intel XPU") as demo:
 
             with gr.Row():
                 width = gr.Slider(
-                    label="Width", minimum=512, maximum=1536, step=64, value=1024
+                    label="Width", minimum=512, maximum=1536, step=16, value=1024
                 )
                 height = gr.Slider(
-                    label="Height", minimum=512, maximum=1536, step=64, value=1024
+                    label="Height", minimum=512, maximum=1536, step=16, value=1024
                 )
 
             with gr.Row():
                 steps = gr.Slider(
-                    label="Inference steps", minimum=1, maximum=20, step=1, value=4
+                    label="Inference steps", minimum=1, maximum=30, step=1, value=9
                 )
                 guidance_scale = gr.Slider(
-                    label="Guidance scale", minimum=0.0, maximum=10.0, step=0.5, value=0.0
+                    label="Guidance scale (0 = turbo/no CFG)", minimum=0.0, maximum=10.0, step=0.5, value=0.0
                 )
 
             seed = gr.Number(label="Seed (-1 = random)", value=-1, precision=0)
@@ -99,9 +99,9 @@ with gr.Blocks(title="Z-Image-Turbo · Intel XPU") as demo:
 
     gr.Examples(
         examples=[
-            ["A futuristic cityscape at sunset, ultra detailed, cinematic lighting", "", 1024, 1024, 4, 0.0, 42],
-            ["A close-up portrait of a red panda in a forest, studio lighting", "blurry, low quality", 1024, 1024, 4, 0.0, 7],
-            ["An oil painting of a sailing ship in a storm", "", 1024, 1024, 4, 0.0, -1],
+            ["A futuristic cityscape at sunset, ultra detailed, cinematic lighting", "", 1024, 1024, 9, 0.0, 42],
+            ["A close-up portrait of a red panda in a forest, studio lighting", "blurry, low quality", 1024, 1024, 9, 0.0, 7],
+            ["An oil painting of a sailing ship in a storm", "", 1024, 1024, 9, 0.0, -1],
         ],
         inputs=[prompt, negative_prompt, width, height, steps, guidance_scale, seed],
         outputs=output_image,

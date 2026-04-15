@@ -1,7 +1,9 @@
-# Diffusers ecosystem
+# Diffusers (VAE only)
 diffusers
+
+# HuggingFace model download & text encoder
 transformers
-accelerate
+huggingface_hub
 safetensors
 
 # Image handling
