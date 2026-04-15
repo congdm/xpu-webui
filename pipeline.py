@@ -1,28 +1,30 @@
 """
 pipeline.py – Z-Image-Turbo inference on Intel XPU.
 
-Model weights  : https://huggingface.co/Comfy-Org/z_image_turbo  (ComfyUI single-file)
-Text encoder   : https://huggingface.co/Tongyi-MAI/Z-Image-Turbo (Qwen3 tokenizer/encoder)
-VAE            : https://huggingface.co/Tongyi-MAI/Z-Image-Turbo (AutoencoderKL)
+Model weights  : models/diffusion_models/  (ComfyUI single-file .safetensors)
+Text encoder   : models/text_encoders/     (Qwen3 tokenizer/encoder)
+VAE            : models/vae/               (AutoencoderKL)
 
 Core transformer and scheduler are implemented in modules/ (no diffusers pipeline class).
 """
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from diffusers import AutoencoderKL
-from huggingface_hub import hf_hub_download, list_repo_files
 from PIL import Image
 from safetensors.torch import load_file
 from transformers import AutoModel, AutoTokenizer
 
 from modules import FlowMatchEulerDiscreteScheduler, ZImageTransformer2DModel
 
-# ── Model IDs ──────────────────────────────────────────────────────────────────
-COMFY_REPO = "Comfy-Org/z_image_turbo"          # ComfyUI single-file transformer
-DIFFUSERS_REPO = "Tongyi-MAI/Z-Image-Turbo"     # text encoder + VAE + config
+# ── Local model directories ────────────────────────────────────────────────────
+_BASE_DIR = Path(__file__).parent
+DIFFUSION_MODELS_DIR = _BASE_DIR / "models" / "diffusion_models"
+TEXT_ENCODERS_DIR    = _BASE_DIR / "models" / "text_encoders"
+VAE_DIR              = _BASE_DIR / "models" / "vae"
 
 # Transformer default config (matches Tongyi-MAI/Z-Image-Turbo model_index.json)
 TRANSFORMER_CONFIG = dict(
@@ -59,19 +61,20 @@ def _get_device() -> str:
 
 # ── Checkpoint loading ─────────────────────────────────────────────────────────
 
-def _find_safetensors(repo_id: str) -> str:
-    """Return the first .safetensors file in the repo."""
-    for name in list_repo_files(repo_id):
-        if name.endswith(".safetensors"):
-            return name
-    raise FileNotFoundError(f"No .safetensors found in {repo_id}")
+def _find_local_safetensors(directory: Path) -> Path:
+    """Return the first .safetensors file found in the given local directory."""
+    if not directory.exists():
+        raise FileNotFoundError(f"Model directory not found: {directory}")
+    for path in sorted(directory.iterdir()):
+        if path.suffix == ".safetensors":
+            return path
+    raise FileNotFoundError(f"No .safetensors file found in {directory}")
 
 
 def _load_transformer(device: str) -> ZImageTransformer2DModel:
-    """Download the ComfyUI single-file checkpoint and load into our nn module."""
-    filename = _find_safetensors(COMFY_REPO)
-    ckpt_path = hf_hub_download(repo_id=COMFY_REPO, filename=filename)
-    print(f"  Transformer checkpoint: {filename}")
+    """Load the ComfyUI single-file checkpoint from local disk into our nn module."""
+    ckpt_path = _find_local_safetensors(DIFFUSION_MODELS_DIR)
+    print(f"  Transformer checkpoint: {ckpt_path.name}")
 
     state_dict = load_file(ckpt_path, device="cpu")
 
@@ -167,7 +170,7 @@ class PipelineComponents:
 
 
 def load_pipeline() -> tuple[PipelineComponents, str]:
-    """Download and initialise all pipeline components."""
+    """Load all pipeline components from local model directories."""
     device = _get_device()
     print(f"Device: {device}")
 
@@ -175,17 +178,15 @@ def load_pipeline() -> tuple[PipelineComponents, str]:
     transformer = _load_transformer(device)
 
     print("Loading tokenizer + text encoder…")
-    tokenizer = AutoTokenizer.from_pretrained(DIFFUSERS_REPO, subfolder="tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(TEXT_ENCODERS_DIR)
     text_encoder = AutoModel.from_pretrained(
-        DIFFUSERS_REPO,
-        subfolder="text_encoder",
+        TEXT_ENCODERS_DIR,
         torch_dtype=torch.bfloat16,
     ).to(device).eval()
 
     print("Loading VAE…")
     vae = AutoencoderKL.from_pretrained(
-        DIFFUSERS_REPO,
-        subfolder="vae",
+        VAE_DIR,
         torch_dtype=torch.bfloat16,
     ).to(device).eval()
 
