@@ -5,6 +5,7 @@ diffusers
 transformers
 huggingface_hub
 safetensors
+tiktoken
 
 # Image handling
 Pillow
