@@ -18,7 +18,7 @@
 #   - Removed diffusers/accelerate/ConfigMixin dependencies (plain nn.Module)
 #   - Replaced torch.amp.autocast("cuda") with dtype-cast helpers for XPU compatibility
 #   - Replaced diffusers Attention class with self-contained ZImageAttention
-#   - Replaced dispatch_attention_fn with F.scaled_dot_product_attention
+#   - dispatch_attention_fn provided by modules/attention_dispatch.py (local, no diffusers dep)
 #   - Removed gradient-checkpointing wiring (can be re-added if needed)
 
 import math
@@ -28,6 +28,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+
+from .attention_dispatch import dispatch_attention_fn
 
 # ── Constants (must match model config) ─────────────────────────────────────
 ADALN_EMBED_DIM = 256
@@ -144,6 +146,7 @@ class ZImageAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         freqs_cis: torch.Tensor | None = None,
+        backend: str | None = None,
     ) -> torch.Tensor:
         q = self.to_q(hidden_states).unflatten(-1, (self.heads, self.dim_head))
         k = self.to_k(hidden_states).unflatten(-1, (self.heads, self.dim_head))
@@ -158,15 +161,22 @@ class ZImageAttention(nn.Module):
             k = _apply_rotary_emb(k, freqs_cis)
 
         dtype = q.dtype
-        # [B, S, H, Dh] → [B, H, S, Dh]
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
+        # Expand [B, S] boolean mask → [B, 1, 1, S] so backends that pass it
+        # through to SDPA (or similar) get the right broadcast shape.
         if attention_mask is not None and attention_mask.ndim == 2:
-            # [B, S] → [B, 1, 1, S] (broadcast over heads and query positions)
             attention_mask = attention_mask[:, None, None, :]
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
-        out = out.transpose(1, 2).flatten(2).to(dtype)  # [B, S, H*Dh]
+        # dispatch_attention_fn convention: tensors in [B, S, H, Dh] layout.
+        # Returns [B, S, H, Dh].
+        out = dispatch_attention_fn(
+            q, k, v,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=backend,
+        )
+        out = out.flatten(2).to(dtype)   # [B, S, H*Dh]
         return self.to_out[0](out)
 
 
