@@ -28,6 +28,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 import contextlib
 import threading
 from enum import Enum
@@ -47,6 +49,7 @@ class AttentionBackend(str, Enum):
     via :func:`register_attention_backend`.
     """
     NATIVE = "native"
+    CHUNKED = "chunked"
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
@@ -59,7 +62,14 @@ _BACKENDS: dict[str, Callable] = {}
 _local = threading.local()
 
 # Module-level default (can be changed with set_attention_backend()).
-_DEFAULT_BACKEND: str = AttentionBackend.NATIVE.value
+_DEFAULT_BACKEND: str = (
+    AttentionBackend.CHUNKED.value
+    if hasattr(torch, "xpu") and torch.xpu.is_available()
+    else AttentionBackend.NATIVE.value
+)
+
+# Query-chunk size used by the built-in chunked backend.
+_CHUNK_SIZE_DEFAULT = int(os.environ.get("ZIMAGE_ATTN_CHUNK_SIZE", "256"))
 
 
 def _backend_key(name: str | AttentionBackend) -> str:
@@ -103,6 +113,14 @@ def set_attention_backend(name: str | AttentionBackend) -> None:
     _DEFAULT_BACKEND = _backend_key(name)
 
 
+def set_attention_chunk_size(chunk_size: int) -> None:
+    """Set the module-level default query chunk size for the chunked backend."""
+    global _CHUNK_SIZE_DEFAULT
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+    _CHUNK_SIZE_DEFAULT = int(chunk_size)
+
+
 @contextlib.contextmanager
 def attention_backend(name: str | AttentionBackend = AttentionBackend.NATIVE):
     """Context manager that temporarily switches the active attention backend.
@@ -120,9 +138,28 @@ def attention_backend(name: str | AttentionBackend = AttentionBackend.NATIVE):
         _local.backend = prev
 
 
+@contextlib.contextmanager
+def attention_chunk_size(chunk_size: int):
+    """Temporarily override the active query chunk size for chunked attention."""
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+
+    prev = getattr(_local, "chunk_size", None)
+    _local.chunk_size = int(chunk_size)
+    try:
+        yield
+    finally:
+        _local.chunk_size = prev
+
+
 def _get_active_backend() -> str:
     """Return the currently active backend name."""
     return getattr(_local, "backend", None) or _DEFAULT_BACKEND
+
+
+def _get_active_chunk_size() -> int:
+    """Return the currently active query chunk size."""
+    return getattr(_local, "chunk_size", None) or _CHUNK_SIZE_DEFAULT
 
 
 # ── Built-in backends ─────────────────────────────────────────────────────────
@@ -155,7 +192,66 @@ def _native_backend(
     return out.permute(0, 2, 1, 3)   # [B, S, H, Dh]
 
 
+def _chunked_backend(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """
+    Memory-bounded SDPA by slicing the query sequence into smaller chunks.
+
+    Inputs and output use [B, S, H, Dh] layout.
+    """
+    if is_causal:
+        raise NotImplementedError("Chunked backend currently supports non-causal attention only.")
+
+    q = query.permute(0, 2, 1, 3)  # [B, H, Sq, Dh]
+    k = key.permute(0, 2, 1, 3)    # [B, H, Sk, Dh]
+    v = value.permute(0, 2, 1, 3)  # [B, H, Sk, Dh]
+
+    _, _, seq_len_q, head_dim = q.shape
+    scale_val = float(scale) if scale is not None else (1.0 / math.sqrt(head_dim))
+
+    chunk_size = int(kwargs.get("chunk_size", _get_active_chunk_size()))
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+
+    out = torch.empty_like(q)
+    k_t = k.transpose(-2, -1)
+
+    for start in range(0, seq_len_q, chunk_size):
+        end = min(start + chunk_size, seq_len_q)
+        q_chunk = q[:, :, start:end, :]  # [B, H, C, Dh]
+
+        attn_scores = torch.matmul(q_chunk, k_t) * scale_val  # [B, H, C, Sk]
+
+        if attn_mask is not None:
+            # Handle masks that carry a query dimension by slicing it per chunk.
+            mask_chunk = attn_mask
+            if mask_chunk.ndim >= 4 and mask_chunk.shape[-2] == seq_len_q:
+                mask_chunk = mask_chunk[..., start:end, :]
+
+            if mask_chunk.dtype == torch.bool:
+                attn_scores = attn_scores.masked_fill(~mask_chunk, torch.finfo(attn_scores.dtype).min)
+            else:
+                attn_scores = attn_scores + mask_chunk
+
+        attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q_chunk.dtype)
+        if dropout_p:
+            attn_probs = F.dropout(attn_probs, p=dropout_p, training=False)
+
+        out[:, :, start:end, :] = torch.matmul(attn_probs, v)
+
+    return out.permute(0, 2, 1, 3)  # [B, S, H, Dh]
+
+
 register_attention_backend(AttentionBackend.NATIVE, _native_backend)
+register_attention_backend(AttentionBackend.CHUNKED, _chunked_backend)
 
 
 # ── Public dispatch function ──────────────────────────────────────────────────

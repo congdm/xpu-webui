@@ -23,6 +23,7 @@
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -166,6 +167,10 @@ class ZImageAttention(nn.Module):
         # through to SDPA (or similar) get the right broadcast shape.
         if attention_mask is not None and attention_mask.ndim == 2:
             attention_mask = attention_mask[:, None, None, :]
+
+        # Prefer chunked backend on XPU to reduce peak attention memory.
+        if backend is None and hidden_states.device.type == "xpu":
+            backend = "chunked"
 
         # dispatch_attention_fn convention: tensors in [B, S, H, Dh] layout.
         # Returns [B, S, H, Dh].
@@ -440,6 +445,45 @@ class ZImageTransformer2DModel(nn.Module):
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
         self.rope_embedder = RopeEmbedder(theta=rope_theta, axes_dims=axes_dims, axes_lens=axes_lens)
+        self.block_offload = False
+        self._offload_exec_device = torch.device("cpu")
+        self._blocks_per_batch = 1
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Return the dtype of the model's parameters (matches diffusers convention)."""
+        return next(self.parameters()).dtype
+
+    def enable_block_offload(self, execution_device: str, blocks_per_batch: int = 1) -> None:
+        """Enable batch-block CPU↔device offload during forward for low-VRAM GPUs.
+        
+        Args:
+            execution_device: Target device (xpu, cuda, cpu)
+            blocks_per_batch: Number of consecutive blocks to load/compute/offload together (1 = single block)
+        """
+        self.block_offload = True
+        self._offload_exec_device = torch.device(execution_device)
+        self._blocks_per_batch = max(1, blocks_per_batch)
+
+    def disable_block_offload(self) -> None:
+        self.block_offload = False
+        self._offload_exec_device = torch.device("cpu")
+        self._blocks_per_batch = 1
+
+    def _run_module(
+        self,
+        module: nn.Module,
+        *args: Any,
+        force_no_offload: bool = False,
+        **kwargs: Any,
+    ):
+        if not self.block_offload or force_no_offload:
+            return module(*args, **kwargs)
+
+        module = module.to(device=self._offload_exec_device, dtype=self.dtype)
+        out = module(*args, **kwargs)
+        module.to(device="cpu")
+        return out
 
     # ── Patchify helpers ──────────────────────────────────────────────────────
 
@@ -510,8 +554,9 @@ class ZImageTransformer2DModel(nn.Module):
 
         # Replace padding positions with pad_token
         feats_cat = torch.cat(feats, dim=0)
+        pad_token_runtime = pad_token.to(device=feats_cat.device, dtype=feats_cat.dtype)
         mask = torch.cat(inner_pad_mask).unsqueeze(-1)
-        feats_cat = torch.where(mask, pad_token, feats_cat)
+        feats_cat = torch.where(mask, pad_token_runtime, feats_cat)
         feats = list(feats_cat.split(item_seqlens, dim=0))
 
         # RoPE embeddings
@@ -593,6 +638,7 @@ class ZImageTransformer2DModel(nn.Module):
         patch_size: int = 2,
         f_patch_size: int = 1,
         controlnet_block_samples: dict[int, torch.Tensor] | None = None,
+        block_offload: bool | None = None,
     ):
         """
         Args:
@@ -603,9 +649,15 @@ class ZImageTransformer2DModel(nn.Module):
         assert patch_size in self.all_patch_size and f_patch_size in self.all_f_patch_size
         device = x[0].device
         key = f"{patch_size}-{f_patch_size}"
+        use_block_offload = self.block_offload if block_offload is None else block_offload
+        offload_active = use_block_offload and self.block_offload
 
         # Timestep embedding (basic mode: single adaln per sample)
-        adaln_input = self.t_embedder(t * self.t_scale).type_as(x[0])
+        adaln_input = self._run_module(
+            self.t_embedder,
+            t * self.t_scale,
+            force_no_offload=not use_block_offload,
+        ).type_as(x[0])
 
         # Patchify
         x, cap_feats, x_size, x_pos_ids, cap_pos_ids, x_pad_mask, cap_pad_mask = (
@@ -614,35 +666,86 @@ class ZImageTransformer2DModel(nn.Module):
 
         # Image tokens: embed → refine
         x_seqlens = [len(xi) for xi in x]
-        x = self.all_x_embedder[key](torch.cat(x, dim=0))
+        x = self._run_module(
+            self.all_x_embedder[key],
+            torch.cat(x, dim=0),
+            force_no_offload=not use_block_offload,
+        )
         x, x_freqs, x_mask, _, _ = self._prepare_sequence(
             list(x.split(x_seqlens, dim=0)), x_pos_ids, x_pad_mask, self.x_pad_token, device=device
         )
-        for layer in self.noise_refiner:
-            x = layer(x, x_mask, x_freqs, adaln_input)
+        if offload_active and len(self.noise_refiner) > 0:
+            self.noise_refiner[0].to(device=self._offload_exec_device, dtype=self.dtype)
+        for idx, layer in enumerate(self.noise_refiner):
+            if offload_active:
+                if idx + 1 < len(self.noise_refiner):
+                    self.noise_refiner[idx + 1].to(device=self._offload_exec_device, dtype=self.dtype)
+                x = layer(x, x_mask, x_freqs, adaln_input)
+                layer.to(device="cpu")
+            else:
+                x = layer(x, x_mask, x_freqs, adaln_input)
 
         # Caption tokens: embed → refine
         cap_seqlens = [len(ci) for ci in cap_feats]
-        cap_feats = self.cap_embedder(torch.cat(cap_feats, dim=0))
+        cap_feats = self._run_module(
+            self.cap_embedder,
+            torch.cat(cap_feats, dim=0),
+            force_no_offload=not use_block_offload,
+        )
         cap_feats, cap_freqs, cap_mask, _, _ = self._prepare_sequence(
             list(cap_feats.split(cap_seqlens, dim=0)), cap_pos_ids, cap_pad_mask, self.cap_pad_token, device=device
         )
-        for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_mask, cap_freqs)
+        if offload_active and len(self.context_refiner) > 0:
+            self.context_refiner[0].to(device=self._offload_exec_device, dtype=self.dtype)
+        for idx, layer in enumerate(self.context_refiner):
+            if offload_active:
+                if idx + 1 < len(self.context_refiner):
+                    self.context_refiner[idx + 1].to(device=self._offload_exec_device, dtype=self.dtype)
+                cap_feats = layer(cap_feats, cap_mask, cap_freqs)
+                layer.to(device="cpu")
+            else:
+                cap_feats = layer(cap_feats, cap_mask, cap_freqs)
 
         # Unified sequence [x, cap]
         unified, unified_freqs, unified_mask = self._build_unified_sequence(
             x, x_freqs, x_seqlens, cap_feats, cap_freqs, cap_seqlens, device
         )
 
-        # Main transformer layers
-        for idx, layer in enumerate(self.layers):
-            unified = layer(unified, unified_mask, unified_freqs, adaln_input)
-            if controlnet_block_samples is not None and idx in controlnet_block_samples:
-                unified = unified + controlnet_block_samples[idx]
+        # Main transformer layers (batch-processed if offload_active)
+        if offload_active and len(self.layers) > 0:
+            # Batch-block offload: load N blocks → compute all → unload
+            batch_size = self._blocks_per_batch
+            for batch_start in range(0, len(self.layers), batch_size):
+                batch_end = min(batch_start + batch_size, len(self.layers))
+                batch_layers = self.layers[batch_start:batch_end]
+                
+                # Load entire batch to device
+                for layer in batch_layers:
+                    layer.to(device=self._offload_exec_device, dtype=self.dtype)
+                
+                # Execute batch
+                for idx in range(batch_start, batch_end):
+                    unified = self.layers[idx](unified, unified_mask, unified_freqs, adaln_input)
+                    if controlnet_block_samples is not None and idx in controlnet_block_samples:
+                        unified = unified + controlnet_block_samples[idx]
+                
+                # Offload batch back to CPU
+                for layer in batch_layers:
+                    layer.to(device="cpu")
+        else:
+            # Non-offload: standard layer-by-layer execution
+            for idx, layer in enumerate(self.layers):
+                unified = layer(unified, unified_mask, unified_freqs, adaln_input)
+                if controlnet_block_samples is not None and idx in controlnet_block_samples:
+                    unified = unified + controlnet_block_samples[idx]
 
         # Final projection
-        unified = self.all_final_layer[key](unified, c=adaln_input)
+        unified = self._run_module(
+            self.all_final_layer[key],
+            unified,
+            c=adaln_input,
+            force_no_offload=not use_block_offload,
+        )
 
         # Unpatchify
         x = self.unpatchify(list(unified.unbind(dim=0)), x_size, patch_size, f_patch_size)

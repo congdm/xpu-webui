@@ -11,3 +11,7 @@ Pillow
 
 # Web UI
 gradio
+websockets
+
+# CLI progress bar
+tqdm
