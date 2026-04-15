@@ -1,0 +1,13 @@
+# Diffusers (VAE only)
+diffusers
+
+# HuggingFace model download & text encoder
+transformers
+huggingface_hub
+safetensors
+
+# Image handling
+Pillow
+
+# Web UI
+gradio
