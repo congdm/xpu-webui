@@ -178,7 +178,7 @@ def load_pipeline() -> tuple[PipelineComponents, str]:
     transformer = _load_transformer(device)
 
     print("Loading tokenizer + text encoder…")
-    tokenizer = AutoTokenizer.from_pretrained(TEXT_ENCODERS_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(TEXT_ENCODERS_DIR, use_fast=False)
     text_encoder = AutoModel.from_pretrained(
         TEXT_ENCODERS_DIR,
         torch_dtype=torch.bfloat16,
