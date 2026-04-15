@@ -1,0 +1,11 @@
+# Diffusers ecosystem
+diffusers
+transformers
+accelerate
+safetensors
+
+# Image handling
+Pillow
+
+# Web UI
+gradio

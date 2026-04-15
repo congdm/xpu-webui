@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# HuggingFace model cache / weights
+.cache/
+model_cache/
+*.safetensors
+*.bin
+*.ckpt
+*.pt
+*.pth
+
+# Generated images / outputs
+outputs/
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
