@@ -27,9 +27,9 @@ def run_inference(
     steps: int,
     guidance_scale: float,
     seed: int,
+    attn_backend: str,
     attn_chunk_size: int,
     transformer_block_offload: bool,
-    offload_blocks_per_batch: int,
 ):
     if not prompt.strip():
         raise gr.Error("Please enter a prompt.")
@@ -42,10 +42,11 @@ def run_inference(
         steps=steps,
         guidance_scale=guidance_scale,
         seed=seed,
+        attn_backend=attn_backend,
         attn_chunk_size=attn_chunk_size,
         transformer_block_offload=transformer_block_offload,
-        offload_blocks_per_batch=offload_blocks_per_batch,
     )
+
     return image
 
 # ---------------------------------------------------------------------------
@@ -98,17 +99,15 @@ with gr.Blocks(title="Z-Image-Turbo · Intel XPU", analytics_enabled=False) as d
                 value=256,
             )
 
+            attn_backend = gr.Radio(
+                label="Attention backend",
+                choices=["chunked", "native"],
+                value="chunked",
+            )
+
             transformer_block_offload = gr.Checkbox(
                 label="Transformer block-by-block offload (much lower VRAM, slower)",
                 value=True,
-            )
-
-            offload_blocks_per_batch = gr.Slider(
-                label="Offload blocks per batch (only active with block offload; higher = more VRAM, faster)",
-                minimum=1,
-                maximum=30,
-                step=1,
-                value=1,
             )
 
             seed = gr.Number(label="Seed (-1 = random)", value=-1, precision=0)
@@ -120,21 +119,21 @@ with gr.Blocks(title="Z-Image-Turbo · Intel XPU", analytics_enabled=False) as d
 
     generate_btn.click(
         fn=run_inference,
-        inputs=[prompt, negative_prompt, width, height, steps, guidance_scale, seed, attn_chunk_size, transformer_block_offload, offload_blocks_per_batch],
-        outputs=output_image,
+        inputs=[prompt, negative_prompt, width, height, steps, guidance_scale, seed, attn_backend, attn_chunk_size, transformer_block_offload],
+        outputs=[output_image],
     )
 
     gr.Examples(
         examples=[
-            ["A futuristic cityscape at sunset, ultra detailed, cinematic lighting", "", 1024, 1024, 9, 0.0, 42, 256, True, 1],
-            ["A close-up portrait of a red panda in a forest, studio lighting", "blurry, low quality", 1024, 1024, 9, 0.0, 7, 256, True, 1],
-            ["An oil painting of a sailing ship in a storm", "", 1024, 1024, 9, 0.0, -1, 256, True, 1],
+            ["A futuristic cityscape at sunset, ultra detailed, cinematic lighting", "", 1024, 1024, 9, 0.0, 42, "chunked", 256, True],
+            ["A close-up portrait of a red panda in a forest, studio lighting", "blurry, low quality", 1024, 1024, 9, 0.0, 7, "chunked", 256, True],
+            ["An oil painting of a sailing ship in a storm", "", 1024, 1024, 9, 0.0, -1, "chunked", 256, True],
         ],
-        inputs=[prompt, negative_prompt, width, height, steps, guidance_scale, seed, attn_chunk_size, transformer_block_offload, offload_blocks_per_batch],
-        outputs=output_image,
-        fn=run_inference,
+        inputs=[prompt, negative_prompt, width, height, steps, guidance_scale, seed, attn_backend, attn_chunk_size, transformer_block_offload],
+        # Keep examples as input presets only. Triggering generation directly from
+        # examples can create long-running startup/background UI states.
         cache_examples=False,
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    demo.launch(server_name="127.0.0.1", server_port=7860, show_error=True)

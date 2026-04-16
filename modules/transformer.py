@@ -21,9 +21,11 @@
 #   - dispatch_attention_fn provided by modules/attention_dispatch.py (local, no diffusers dep)
 #   - Removed gradient-checkpointing wiring (can be re-added if needed)
 
+import contextlib
 import math
 from dataclasses import dataclass
 from typing import Any
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -36,6 +38,7 @@ from .attention_dispatch import dispatch_attention_fn
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 X_PAD_DIM = 64
+ENABLE_ASYNC_OFFLOAD_PREFETCH = True  # Temporary benchmark toggle.
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -58,6 +61,22 @@ class RMSNorm(nn.Module):
         x = x.float()
         norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         return (x * norm * self.weight.float()).to(orig_dtype)
+
+
+@contextlib.contextmanager
+def _device_stream_context(dev: torch.device, stream):
+    """Context manager that runs a block inside the given device stream."""
+    if stream is None:
+        yield
+        return
+    if dev.type == "xpu" and hasattr(torch, "xpu"):
+        with torch.xpu.stream(stream):
+            yield
+    elif dev.type == "cuda":
+        with torch.cuda.stream(stream):
+            yield
+    else:
+        yield
 
 
 def _apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -114,7 +133,10 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # SwiGLU with in-place gate multiplication to reduce intermediate traffic.
+        gate = F.silu(self.w1(x))
+        gate.mul_(self.w3(x))
+        return self.w2(gate)
 
 
 class ZImageAttention(nn.Module):
@@ -167,10 +189,6 @@ class ZImageAttention(nn.Module):
         # through to SDPA (or similar) get the right broadcast shape.
         if attention_mask is not None and attention_mask.ndim == 2:
             attention_mask = attention_mask[:, None, None, :]
-
-        # Prefer chunked backend on XPU to reduce peak attention memory.
-        if backend is None and hidden_states.device.type == "xpu":
-            backend = "chunked"
 
         # dispatch_attention_fn convention: tensors in [B, S, H, Dh] layout.
         # Returns [B, S, H, Dh].
@@ -447,28 +465,103 @@ class ZImageTransformer2DModel(nn.Module):
         self.rope_embedder = RopeEmbedder(theta=rope_theta, axes_dims=axes_dims, axes_lens=axes_lens)
         self.block_offload = False
         self._offload_exec_device = torch.device("cpu")
-        self._blocks_per_batch = 1
+        self._offload_main_workers: nn.ModuleList | None = None  # 2 slots for double-buffer
+        self._offload_noise_worker: nn.Module | None = None
+        self._offload_context_worker: nn.Module | None = None
+        self._copy_stream = None  # dedicated H2D copy stream
 
     @property
     def dtype(self) -> torch.dtype:
         """Return the dtype of the model's parameters (matches diffusers convention)."""
         return next(self.parameters()).dtype
 
-    def enable_block_offload(self, execution_device: str, blocks_per_batch: int = 1) -> None:
-        """Enable batch-block CPU↔device offload during forward for low-VRAM GPUs.
-        
+    def enable_block_offload(self, execution_device: str) -> None:
+        """Enable async double-buffer CPU→device offload during forward.
+
+        Keeps two worker slots resident on device and overlaps H2D weight copies
+        with computation via a dedicated copy stream.
+
         Args:
-            execution_device: Target device (xpu, cuda, cpu)
-            blocks_per_batch: Number of consecutive blocks to load/compute/offload together (1 = single block)
+            execution_device: Target device string (e.g. 'xpu', 'cuda').
         """
         self.block_offload = True
         self._offload_exec_device = torch.device(execution_device)
-        self._blocks_per_batch = max(1, blocks_per_batch)
+        self._copy_stream = None  # reset; will be created lazily in forward
+        self._ensure_offload_workers()
 
     def disable_block_offload(self) -> None:
         self.block_offload = False
         self._offload_exec_device = torch.device("cpu")
-        self._blocks_per_batch = 1
+        self._offload_main_workers = None
+        self._offload_noise_worker = None
+        self._offload_context_worker = None
+        self._copy_stream = None
+
+    @staticmethod
+    def _copy_module_tensors_(dst: nn.Module, src: nn.Module) -> None:
+        with torch.no_grad():
+            for dst_p, src_p in zip(dst.parameters(), src.parameters()):
+                dst_p.copy_(src_p, non_blocking=True)
+            for dst_b, src_b in zip(dst.buffers(), src.buffers()):
+                dst_b.copy_(src_b, non_blocking=True)
+
+    def _ensure_offload_workers(self) -> None:
+        if not self.block_offload:
+            return
+
+        def _module_device(module: nn.Module | None) -> torch.device | None:
+            if module is None:
+                return None
+            try:
+                return next(module.parameters()).device
+            except StopIteration:
+                return None
+
+        # Always maintain exactly 2 device worker slots for double-buffer prefetch.
+        recreate_main = (
+            self._offload_main_workers is None
+            or len(self._offload_main_workers) != 2
+            or _module_device(self._offload_main_workers[0]) != self._offload_exec_device
+        )
+        if recreate_main and len(self.layers) > 0:
+            worker_template = deepcopy(self.layers[0]).to(
+                device=self._offload_exec_device,
+                dtype=self.dtype,
+            )
+            self._offload_main_workers = nn.ModuleList(
+                [deepcopy(worker_template), deepcopy(worker_template)]
+            )
+
+        if (
+            (self._offload_noise_worker is None or _module_device(self._offload_noise_worker) != self._offload_exec_device)
+            and len(self.noise_refiner) > 0
+        ):
+            self._offload_noise_worker = deepcopy(self.noise_refiner[0]).to(
+                device=self._offload_exec_device,
+                dtype=self.dtype,
+            )
+
+        if (
+            (self._offload_context_worker is None or _module_device(self._offload_context_worker) != self._offload_exec_device)
+            and len(self.context_refiner) > 0
+        ):
+            self._offload_context_worker = deepcopy(self.context_refiner[0]).to(
+                device=self._offload_exec_device,
+                dtype=self.dtype,
+            )
+
+    def _get_copy_stream(self):
+        """Return (or lazily create) a dedicated H2D copy stream for the offload device."""
+        if self._copy_stream is not None:
+            return self._copy_stream
+        dev = self._offload_exec_device
+        if dev.type == "xpu" and hasattr(torch, "xpu"):
+            self._copy_stream = torch.xpu.Stream(device=dev)
+        elif dev.type == "cuda":
+            self._copy_stream = torch.cuda.Stream(device=dev)
+        else:
+            self._copy_stream = None
+        return self._copy_stream
 
     def _run_module(
         self,
@@ -674,14 +767,12 @@ class ZImageTransformer2DModel(nn.Module):
         x, x_freqs, x_mask, _, _ = self._prepare_sequence(
             list(x.split(x_seqlens, dim=0)), x_pos_ids, x_pad_mask, self.x_pad_token, device=device
         )
-        if offload_active and len(self.noise_refiner) > 0:
-            self.noise_refiner[0].to(device=self._offload_exec_device, dtype=self.dtype)
-        for idx, layer in enumerate(self.noise_refiner):
+        for layer in self.noise_refiner:
             if offload_active:
-                if idx + 1 < len(self.noise_refiner):
-                    self.noise_refiner[idx + 1].to(device=self._offload_exec_device, dtype=self.dtype)
-                x = layer(x, x_mask, x_freqs, adaln_input)
-                layer.to(device="cpu")
+                if self._offload_noise_worker is None:
+                    raise RuntimeError("Offload worker for noise refiner is not initialized")
+                self._copy_module_tensors_(self._offload_noise_worker, layer)
+                x = self._offload_noise_worker(x, x_mask, x_freqs, adaln_input)
             else:
                 x = layer(x, x_mask, x_freqs, adaln_input)
 
@@ -695,14 +786,12 @@ class ZImageTransformer2DModel(nn.Module):
         cap_feats, cap_freqs, cap_mask, _, _ = self._prepare_sequence(
             list(cap_feats.split(cap_seqlens, dim=0)), cap_pos_ids, cap_pad_mask, self.cap_pad_token, device=device
         )
-        if offload_active and len(self.context_refiner) > 0:
-            self.context_refiner[0].to(device=self._offload_exec_device, dtype=self.dtype)
-        for idx, layer in enumerate(self.context_refiner):
+        for layer in self.context_refiner:
             if offload_active:
-                if idx + 1 < len(self.context_refiner):
-                    self.context_refiner[idx + 1].to(device=self._offload_exec_device, dtype=self.dtype)
-                cap_feats = layer(cap_feats, cap_mask, cap_freqs)
-                layer.to(device="cpu")
+                if self._offload_context_worker is None:
+                    raise RuntimeError("Offload worker for context refiner is not initialized")
+                self._copy_module_tensors_(self._offload_context_worker, layer)
+                cap_feats = self._offload_context_worker(cap_feats, cap_mask, cap_freqs)
             else:
                 cap_feats = layer(cap_feats, cap_mask, cap_freqs)
 
@@ -711,27 +800,78 @@ class ZImageTransformer2DModel(nn.Module):
             x, x_freqs, x_seqlens, cap_feats, cap_freqs, cap_seqlens, device
         )
 
-        # Main transformer layers (batch-processed if offload_active)
+        # Main transformer layers
         if offload_active and len(self.layers) > 0:
-            # Batch-block offload: load N blocks → compute all → unload
-            batch_size = self._blocks_per_batch
-            for batch_start in range(0, len(self.layers), batch_size):
-                batch_end = min(batch_start + batch_size, len(self.layers))
-                batch_layers = self.layers[batch_start:batch_end]
-                
-                # Load entire batch to device
-                for layer in batch_layers:
-                    layer.to(device=self._offload_exec_device, dtype=self.dtype)
-                
-                # Execute batch
-                for idx in range(batch_start, batch_end):
-                    unified = self.layers[idx](unified, unified_mask, unified_freqs, adaln_input)
+            if self._offload_main_workers is None:
+                raise RuntimeError("Offload workers for main layers are not initialized")
+
+            workers = self._offload_main_workers  # [slot_A, slot_B]
+            exec_dev = self._offload_exec_device
+            copy_stream = self._get_copy_stream()
+
+            # Resolve compute stream and event factories for the execution device.
+            if exec_dev.type == "xpu" and hasattr(torch, "xpu"):
+                compute_stream = torch.xpu.current_stream(exec_dev)
+                def _make_event(): return torch.xpu.Event()
+            elif exec_dev.type == "cuda":
+                compute_stream = torch.cuda.current_stream(exec_dev)
+                def _make_event(): return torch.cuda.Event()
+            else:
+                compute_stream = None
+                def _make_event(): return None
+
+            if ENABLE_ASYNC_OFFLOAD_PREFETCH and copy_stream is not None and compute_stream is not None:
+                # ── Async double-buffer prefetch ──────────────────────────────
+                # slot A = workers[0], slot B = workers[1], alternate each layer.
+                #   copy_stream:   H2D weight copies (non-blocking)
+                #   compute_stream: transformer forward passes
+                # Events track when each slot's copy / compute finishes so the
+                # two streams synchronise only as tightly as necessary.
+
+                copy_events    = [_make_event(), _make_event()]   # fired when slot loaded
+                compute_events = [_make_event(), _make_event()]   # fired when slot compute done
+
+                # Pre-record "compute done" for slot 1 (never used yet → fires immediately)
+                compute_events[1].record(compute_stream)
+
+                # Prime slot 0 with layer[0] on copy_stream
+                with _device_stream_context(exec_dev, copy_stream):
+                    self._copy_module_tensors_(workers[0], self.layers[0])
+                copy_events[0].record(copy_stream)
+
+                for idx in range(len(self.layers)):
+                    active_slot = idx % 2
+                    next_slot   = 1 - active_slot
+
+                    # Prefetch layer[idx+1] into next_slot while current computes.
+                    if idx + 1 < len(self.layers):
+                        # copy_stream must wait until next_slot's PREVIOUS compute finishes
+                        # (so we don't overwrite weights still being used).
+                        copy_stream.wait_event(compute_events[next_slot])
+                        with _device_stream_context(exec_dev, copy_stream):
+                            self._copy_module_tensors_(workers[next_slot], self.layers[idx + 1])
+                        copy_events[next_slot].record(copy_stream)
+
+                    # compute_stream waits for active_slot's copy to be ready.
+                    compute_stream.wait_event(copy_events[active_slot])
+                    unified = workers[active_slot](unified, unified_mask, unified_freqs, adaln_input)
                     if controlnet_block_samples is not None and idx in controlnet_block_samples:
                         unified = unified + controlnet_block_samples[idx]
-                
-                # Offload batch back to CPU
-                for layer in batch_layers:
-                    layer.to(device="cpu")
+                    compute_events[active_slot].record(compute_stream)
+
+                # Ensure all async work is done before leaving the offload block.
+                if exec_dev.type == "xpu" and hasattr(torch, "xpu"):
+                    torch.xpu.synchronize(exec_dev)
+                elif exec_dev.type == "cuda":
+                    torch.cuda.synchronize(exec_dev)
+
+            else:
+                # No stream support (CPU or unknown device): sequential sync fallback.
+                for idx, layer in enumerate(self.layers):
+                    self._copy_module_tensors_(workers[idx % 2], layer)
+                    unified = workers[idx % 2](unified, unified_mask, unified_freqs, adaln_input)
+                    if controlnet_block_samples is not None and idx in controlnet_block_samples:
+                        unified = unified + controlnet_block_samples[idx]
         else:
             # Non-offload: standard layer-by-layer execution
             for idx, layer in enumerate(self.layers):

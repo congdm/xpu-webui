@@ -12,6 +12,7 @@ import math
 import json
 import gc
 import os
+import time
 import contextlib
 from copy import deepcopy
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from modules import (
     FlowMatchEulerDiscreteScheduler,
     ZImageTransformer2DModel,
+    attention_backend,
     attention_chunk_size,
 )
 
@@ -568,8 +570,8 @@ def generate(
     guidance_scale: float = 0.0,
     seed: int = -1,
     attn_chunk_size: int | None = None,
+    attn_backend: str = "chunked",
     transformer_block_offload: bool = False,
-    offload_blocks_per_batch: int = 1,
 ) -> Image.Image:
     """
     Run Z-Image-Turbo text-to-image inference and return a PIL image.
@@ -583,17 +585,18 @@ def generate(
         guidance_scale:  CFG weight; 0.0 disables classifier-free guidance.
         seed:            RNG seed (-1 = random).
         attn_chunk_size: Query chunk size for chunked transformer attention.
+        attn_backend:    Attention backend name ("chunked" or "native").
         transformer_block_offload:
-                         Keep transformer weights on CPU and execute layers
-                         block-by-block on device to reduce peak VRAM.
-        offload_blocks_per_batch:
-                         Number of consecutive blocks to load/compute/offload together
-                         (higher = better VRAM utilization, more memory per step).
+                         Keep transformer weights on CPU and use async double-buffer
+                         prefetch to overlap H2D copies with GPU compute.
     """
     device = components.device
 
     if attn_chunk_size is not None and attn_chunk_size <= 0:
         raise ValueError(f"attn_chunk_size must be > 0, got {attn_chunk_size}")
+
+    if attn_backend not in {"chunked", "native"}:
+        raise ValueError(f"attn_backend must be 'chunked' or 'native', got {attn_backend!r}")
 
     # ── Validate resolution
     vae_scale = VAE_SCALE_FACTOR * 2  # = 16
@@ -639,16 +642,18 @@ def generate(
 
     if transformer_block_offload:
         print("Transformer denoising with block-by-block offload…")
-        components.transformer.enable_block_offload(device, blocks_per_batch=offload_blocks_per_batch)
+        components.transformer.enable_block_offload(device)
     else:
         print("Loading transformer to GPU for denoising…")
         components.transformer.to(device=device, dtype=torch.bfloat16)
 
     transformer = components.transformer
+
+    backend_ctx = attention_backend(attn_backend)
     chunk_ctx = attention_chunk_size(attn_chunk_size) if attn_chunk_size is not None else contextlib.nullcontext()
     try:
-        with chunk_ctx:
-            for t in tqdm(timesteps, total=len(timesteps), desc="Denoising", leave=False):
+        with backend_ctx, chunk_ctx:
+            for t in tqdm(timesteps, total=len(timesteps), desc="Denoising", leave=True):
                 timestep = t.expand(latents.shape[0])
                 t_norm = (1000 - timestep) / 1000      # normalise to [0, 1]
 
@@ -707,4 +712,6 @@ def generate(
     # image_tensor: [1, 3, H, W] in [-1, 1] (standard VAE output)
     image_tensor = (image_tensor.float().clamp(-1, 1) + 1) / 2   # → [0, 1]
     image_np = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype("uint8")
-    return Image.fromarray(image_np)
+    image = Image.fromarray(image_np)
+
+    return image

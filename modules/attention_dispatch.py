@@ -181,7 +181,7 @@ def _native_backend(
     q = query.permute(0, 2, 1, 3)   # [B, H, S, Dh]
     k = key.permute(0, 2, 1, 3)
     v = value.permute(0, 2, 1, 3)
-
+    
     out = F.scaled_dot_product_attention(
         q, k, v,
         attn_mask=attn_mask,
@@ -222,30 +222,41 @@ def _chunked_backend(
         raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
 
     out = torch.empty_like(q)
-    k_t = k.transpose(-2, -1)
 
     for start in range(0, seq_len_q, chunk_size):
         end = min(start + chunk_size, seq_len_q)
         q_chunk = q[:, :, start:end, :]  # [B, H, C, Dh]
 
-        attn_scores = torch.matmul(q_chunk, k_t) * scale_val  # [B, H, C, Sk]
+        # Handle masks that carry a query dimension by slicing it per chunk.
+        mask_chunk = attn_mask
+        if mask_chunk is not None and mask_chunk.ndim >= 4 and mask_chunk.shape[-2] == seq_len_q:
+            mask_chunk = mask_chunk[..., start:end, :]
 
-        if attn_mask is not None:
-            # Handle masks that carry a query dimension by slicing it per chunk.
-            mask_chunk = attn_mask
-            if mask_chunk.ndim >= 4 and mask_chunk.shape[-2] == seq_len_q:
-                mask_chunk = mask_chunk[..., start:end, :]
+        try:
+            # Keep chunked memory behavior while using optimized SDPA kernels.
+            out[:, :, start:end, :] = F.scaled_dot_product_attention(
+                q_chunk,
+                k,
+                v,
+                attn_mask=mask_chunk,
+                dropout_p=dropout_p,
+                is_causal=False,
+                scale=scale,
+            )
+        except RuntimeError:
+            # Fallback for runtimes that cannot handle SDPA in this configuration.
+            k_t = k.transpose(-2, -1)
+            attn_scores = torch.matmul(q_chunk, k_t) * scale_val  # [B, H, C, Sk]
+            if mask_chunk is not None:
+                if mask_chunk.dtype == torch.bool:
+                    attn_scores = attn_scores.masked_fill(~mask_chunk, torch.finfo(attn_scores.dtype).min)
+                else:
+                    attn_scores = attn_scores + mask_chunk
 
-            if mask_chunk.dtype == torch.bool:
-                attn_scores = attn_scores.masked_fill(~mask_chunk, torch.finfo(attn_scores.dtype).min)
-            else:
-                attn_scores = attn_scores + mask_chunk
-
-        attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q_chunk.dtype)
-        if dropout_p:
-            attn_probs = F.dropout(attn_probs, p=dropout_p, training=False)
-
-        out[:, :, start:end, :] = torch.matmul(attn_probs, v)
+            attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q_chunk.dtype)
+            if dropout_p:
+                attn_probs = F.dropout(attn_probs, p=dropout_p, training=False)
+            out[:, :, start:end, :] = torch.matmul(attn_probs, v)
 
     return out.permute(0, 2, 1, 3)  # [B, S, H, Dh]
 
