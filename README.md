@@ -1,6 +1,6 @@
 # xpu-webui
 
-A Gradio web UI for [Z-Image-Turbo](https://huggingface.co/Comfy-Org/z_image_turbo) on Intel XPU (e.g. Intel Arc B580) using **native PyTorch XPU support** (no IPEX required).
+A Gradio web UI for [Z-Image-Turbo](https://huggingface.co/Comfy-Org/z_image_turbo) on Intel XPU (e.g. Intel Arc B580) using native PyTorch XPU support.
 
 ## Architecture
 
