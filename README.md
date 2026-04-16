@@ -55,7 +55,6 @@ models/
 	text_encoders/
 		qwen_3_4b.safetensors
 		config.json                # optional; built-in fallback exists for Z-Image-Turbo
-	tokenizer/
 		tokenizer.json
 		tokenizer_config.json
 		merges.txt
@@ -65,7 +64,7 @@ models/
 		config.json                # optional; built-in fallback exists for Z-Image-Turbo
 ```
 
-The tokenizer files come from the upstream `tokenizer/` folder. The text encoder and VAE weights are loaded directly from local `.safetensors` files rather than via `from_pretrained(...)` weight loading.
+The tokenizer files (tokenizer.json, tokenizer_config.json, merges.txt, vocab.json) come from the upstream `tokenizer/` folder (https://huggingface.co/Tongyi-MAI/Z-Image-Turbo/tree/main/tokenizer). The text encoder and VAE weights are loaded directly from local `.safetensors` files rather than via `from_pretrained(...)` weight loading.
 
 ## Settings
 
@@ -77,7 +76,6 @@ The tokenizer files come from the upstream `tokenizer/` folder. The text encoder
 | Inference steps | 9 | Recommended by upstream; more steps = higher quality |
 | Guidance scale | 0.0 | CFG weight — 0 = turbo mode (no classifier-free guidance) |
 | Transformer block offload | On | Runs transformer layers one-by-one from CPU to GPU for lower VRAM; slower |
-| Offload blocks per batch | 1 | When block offload is on, process N blocks together (higher = faster but more VRAM per step) |
 | Seed | -1 | Fixed seed for reproducibility; -1 uses a random seed |
 
 ## Model
