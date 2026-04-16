@@ -42,9 +42,9 @@ All model files must exist locally before launch.
 For low-VRAM GPUs, runtime stages are loaded on-demand during generation:
 1. Load tokenizer + text encoder, encode prompt, unload both.
 2. Transformer stage (preloaded to CPU at startup):
-   - Block offload ON: stream blocks CPU→GPU during denoising, no GPU memory for full model.
-   - Block offload OFF: copy full transformer to GPU, denoise, move back to CPU after.
-This reduces peak VRAM usage at the cost of longer per-image latency.
+	- Mode `offload` (default): stream blocks CPU→GPU during denoising, minimizing VRAM.
+	- Mode `persistent`: keep full transformer resident on GPU across generations (higher VRAM, lower latency).
+The default mode prioritizes compatibility with lower-VRAM GPUs.
 
 Expected local layout:
 
@@ -75,7 +75,7 @@ The tokenizer files (tokenizer.json, tokenizer_config.json, merges.txt, vocab.js
 | Width / Height | 1024 | Output resolution; must be multiples of 16, max 1536 |
 | Inference steps | 9 | Recommended by upstream; more steps = higher quality |
 | Guidance scale | 0.0 | CFG weight — 0 = turbo mode (no classifier-free guidance) |
-| Transformer block offload | On | Runs transformer layers one-by-one from CPU to GPU for lower VRAM; slower |
+| Transformer runtime mode | offload | `offload` (default, lower VRAM) or `persistent` (higher VRAM, faster after first load) |
 | Seed | -1 | Fixed seed for reproducibility; -1 uses a random seed |
 
 ## Model

@@ -448,6 +448,7 @@ class PipelineComponents:
     scheduler: FlowMatchEulerDiscreteScheduler
     device: str
     transformer: ZImageTransformer2DModel | None = None
+    transformer_resident_on_device: bool = False
 
 
 def _clear_device_cache(device: str) -> None:
@@ -571,7 +572,7 @@ def generate(
     seed: int = -1,
     attn_chunk_size: int | None = None,
     attn_backend: str = "chunked",
-    transformer_block_offload: bool = False,
+    generation_mode: str = "offload",
 ) -> Image.Image:
     """
     Run Z-Image-Turbo text-to-image inference and return a PIL image.
@@ -586,9 +587,9 @@ def generate(
         seed:            RNG seed (-1 = random).
         attn_chunk_size: Query chunk size for chunked transformer attention.
         attn_backend:    Attention backend name ("chunked" or "native").
-        transformer_block_offload:
-                         Keep transformer weights on CPU and use async double-buffer
-                         prefetch to overlap H2D copies with GPU compute.
+        generation_mode: Transformer runtime mode:
+                 - "offload": keep master weights on CPU and offload blocks.
+                 - "persistent": keep full transformer resident on device.
     """
     device = components.device
 
@@ -597,6 +598,9 @@ def generate(
 
     if attn_backend not in {"chunked", "native"}:
         raise ValueError(f"attn_backend must be 'chunked' or 'native', got {attn_backend!r}")
+
+    if generation_mode not in {"offload", "persistent"}:
+        raise ValueError(f"generation_mode must be 'offload' or 'persistent', got {generation_mode!r}")
 
     # ── Validate resolution
     vae_scale = VAE_SCALE_FACTOR * 2  # = 16
@@ -636,16 +640,28 @@ def generate(
     timesteps = components.scheduler.timesteps
 
     # ── Denoising loop (use preloaded transformer)
-    if transformer_block_offload and device == "cpu":
-        print("  [warn] transformer_block_offload ignored on CPU device")
-        transformer_block_offload = False
+    use_offload = generation_mode == "offload"
 
-    if transformer_block_offload:
-        print("Transformer denoising with block-by-block offload…")
+    if use_offload and device == "cpu":
+        print("  [warn] offload mode has no effect on CPU; using CPU execution")
+        use_offload = False
+
+    if use_offload:
+        if components.transformer_resident_on_device and device != "cpu":
+            print("Switching transformer from persistent GPU mode back to CPU for offload mode…")
+            components.transformer.to(device="cpu", dtype=torch.bfloat16)
+            components.transformer_resident_on_device = False
+            _clear_device_cache(device)
+        print("Transformer denoising with block offload mode…")
         components.transformer.enable_block_offload(device)
     else:
-        print("Loading transformer to GPU for denoising…")
-        components.transformer.to(device=device, dtype=torch.bfloat16)
+        components.transformer.disable_block_offload()
+        if device != "cpu" and not components.transformer_resident_on_device:
+            print("Loading transformer to GPU in persistent mode…")
+            components.transformer.to(device=device, dtype=torch.bfloat16)
+            components.transformer_resident_on_device = True
+        elif device != "cpu":
+            print("Using resident transformer on GPU (persistent mode)…")
 
     transformer = components.transformer
 
@@ -687,13 +703,11 @@ def generate(
 
                 latents = components.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
     finally:
-        if transformer_block_offload:
+        if use_offload:
             components.transformer.disable_block_offload()
             print("Transformer block offload complete, keeping on CPU for next request")
-        else:
-            print("Unloading transformer from GPU…")
-            components.transformer.to(device="cpu")
-            _clear_device_cache(device)
+        elif device == "cpu":
+            components.transformer_resident_on_device = False
 
     # ── VAE decode (load/unload VAE on-demand)
     print("Loading VAE for decode…")
