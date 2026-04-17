@@ -1,0 +1,5 @@
+{
+  "attn_chunk_size": 128,
+  "attn_backend": "native",
+  "generation_mode": "offload"
+}

@@ -6,7 +6,70 @@ Run:
 """
 
 import gradio as gr
+import json
+import os
+from pathlib import Path
 from pipeline import load_pipeline, generate
+
+# ---------------------------------------------------------------------------
+# Configuration handling
+# ---------------------------------------------------------------------------
+CONFIG_PATH = Path(__file__).parent / "webui_config.json"
+
+def load_webui_config() -> dict:
+    """Load web UI configuration from JSON file, return defaults if missing."""
+    default_config = {
+        "attn_chunk_size": 256,
+        "attn_backend": "chunked",
+        "generation_mode": "offload"
+    }
+    
+    if not CONFIG_PATH.exists():
+        print(f"Config file not found at {CONFIG_PATH}, using defaults")
+        return default_config
+    
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        # Ensure all required keys exist
+        for key in default_config:
+            if key not in config:
+                print(f"Config missing key '{key}', using default")
+                config[key] = default_config[key]
+        
+        print(f"Loaded config from {CONFIG_PATH}")
+        return config
+    except Exception as e:
+        print(f"Error loading config from {CONFIG_PATH}: {e}, using defaults")
+        return default_config
+
+def save_webui_config(config: dict) -> bool:
+    """Save web UI configuration to JSON file."""
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        print(f"Saved config to {CONFIG_PATH}")
+        return True
+    except Exception as e:
+        print(f"Error saving config to {CONFIG_PATH}: {e}")
+        return False
+
+def save_current_config(attn_chunk_size: int, attn_backend: str, generation_mode: str) -> None:
+    """Save current settings values to config file."""
+    config = {
+        "attn_chunk_size": attn_chunk_size,
+        "attn_backend": attn_backend,
+        "generation_mode": generation_mode
+    }
+    success = save_webui_config(config)
+    if success:
+        gr.Info("✅ Config saved successfully!")
+    else:
+        gr.Warning("❌ Failed to save config.")
+
+# Load configuration at startup
+webui_config = load_webui_config()
 
 # ---------------------------------------------------------------------------
 # Initialize lightweight pipeline at startup
@@ -64,59 +127,64 @@ with gr.Blocks(title="Z-Image-Turbo · Intel XPU", analytics_enabled=False) as d
 
     with gr.Row():
         with gr.Column(scale=1):
-            prompt = gr.Textbox(
-                label="Prompt",
-                placeholder="A photo of an astronaut riding a horse on Mars",
-                lines=3,
-            )
-            negative_prompt = gr.Textbox(
-                label="Negative prompt",
-                placeholder="blurry, low quality, watermark",
-                lines=2,
-            )
+            with gr.Tabs():
+                with gr.Tab("Generation"):
+                    prompt = gr.Textbox(
+                        label="Prompt",
+                        placeholder="A photo of an astronaut riding a horse on Mars",
+                        lines=3,
+                    )
+                    negative_prompt = gr.Textbox(
+                        label="Negative prompt",
+                        placeholder="blurry, low quality, watermark",
+                        lines=2,
+                    )
 
-            with gr.Row():
-                width = gr.Slider(
-                    label="Width", minimum=512, maximum=1536, step=16, value=1024
-                )
-                height = gr.Slider(
-                    label="Height", minimum=512, maximum=1536, step=16, value=1024
-                )
+                    with gr.Row():
+                        width = gr.Slider(
+                            label="Width", minimum=512, maximum=1536, step=16, value=1024
+                        )
+                        height = gr.Slider(
+                            label="Height", minimum=512, maximum=1536, step=16, value=1024
+                        )
 
-            with gr.Row():
-                steps = gr.Slider(
-                    label="Inference steps", minimum=1, maximum=30, step=1, value=9
-                )
-                guidance_scale = gr.Slider(
-                    label="Guidance scale (0 = turbo/no CFG)", minimum=0.0, maximum=10.0, step=0.5, value=0.0
-                )
+                    with gr.Row():
+                        steps = gr.Slider(
+                            label="Inference steps", minimum=1, maximum=30, step=1, value=9
+                        )
+                        guidance_scale = gr.Slider(
+                            label="Guidance scale (0 = turbo/no CFG)", minimum=0.0, maximum=10.0, step=0.5, value=0.0
+                        )
 
-            attn_chunk_size = gr.Slider(
-                label="Attention chunk size (lower = less VRAM, slower)",
-                minimum=64,
-                maximum=1024,
-                step=32,
-                value=256,
-            )
+                    seed = gr.Number(label="Seed (-1 = random)", value=-1, precision=0)
 
-            attn_backend = gr.Radio(
-                label="Attention backend",
-                choices=["chunked", "native"],
-                value="chunked",
-            )
+                    generate_btn = gr.Button("Generate", variant="primary")
+                
+                with gr.Tab("Settings"):
+                    attn_chunk_size = gr.Slider(
+                        label="Attention chunk size (lower = less VRAM, slower)",
+                        minimum=64,
+                        maximum=1024,
+                        step=32,
+                        value=webui_config["attn_chunk_size"],
+                    )
 
-            generation_mode = gr.Radio(
-                label="Transformer runtime mode",
-                choices=[
-                    ("Offload (default, lower VRAM)", "offload"),
-                    ("Persistent on GPU (faster, high VRAM)", "persistent"),
-                ],
-                value="offload",
-            )
+                    attn_backend = gr.Radio(
+                        label="Attention backend",
+                        choices=["chunked", "native"],
+                        value=webui_config["attn_backend"],
+                    )
 
-            seed = gr.Number(label="Seed (-1 = random)", value=-1, precision=0)
+                    generation_mode = gr.Radio(
+                        label="Transformer runtime mode",
+                        choices=[
+                            ("Offload (default, lower VRAM)", "offload"),
+                            ("Persistent on GPU (faster, high VRAM)", "persistent"),
+                        ],
+                        value=webui_config["generation_mode"],
+                    )
 
-            generate_btn = gr.Button("Generate", variant="primary")
+                    save_config_btn = gr.Button("Save config", variant="secondary")
 
         with gr.Column(scale=1):
             output_image = gr.Image(label="Generated image", type="pil")
@@ -125,6 +193,11 @@ with gr.Blocks(title="Z-Image-Turbo · Intel XPU", analytics_enabled=False) as d
         fn=run_inference,
         inputs=[prompt, negative_prompt, width, height, steps, guidance_scale, seed, attn_backend, attn_chunk_size, generation_mode],
         outputs=[output_image],
+    )
+
+    save_config_btn.click(
+        fn=save_current_config,
+        inputs=[attn_chunk_size, attn_backend, generation_mode],
     )
 
     gr.Examples(
