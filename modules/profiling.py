@@ -1,101 +1,91 @@
-from __future__ import annotations
-
-import time
-from dataclasses import dataclass, field
-from typing import Any
-
 import torch
-
-
-METRIC_TRANSFORMER_STEP = "transformer_step_total_ms"
-METRIC_ATTN_BLOCK = "attention_block_total_ms"
-METRIC_FFN_BLOCK = "ffn_total_ms"
-METRIC_BLOCK_COPY = "block_copy_cpu_to_device_total_ms"
-
-
-_ACTIVE_PROFILER: "GenerationProfiler | None" = None
-
-
-def set_active_profiler(profiler: "GenerationProfiler | None") -> None:
-    global _ACTIVE_PROFILER
-    _ACTIVE_PROFILER = profiler
-
-
-def get_active_profiler() -> "GenerationProfiler | None":
-    return None  # PROFILING DISABLED – restore to: return _ACTIVE_PROFILER
-
+import types
+import time
 
 def _device_type(device: str | torch.device | None) -> str:
     if device is None:
         return "cpu"
-    if isinstance(device, torch.device):
-        return device.type
-    return torch.device(device).type
+    if isinstance(device, str):
+        return device.split(":")[0]
+    return device.type
 
+def torch_gpu(device: str | torch.device | None):
+    device_type = _device_type(device)
+    if device_type == "cuda":
+        return torch.cuda
+    elif device_type == "xpu":
+        return torch.xpu
+    else:
+        return None
 
-@dataclass
-class GenerationProfiler:
-    metadata: dict[str, Any] = field(default_factory=dict)
-    _totals_ms: dict[str, float] = field(default_factory=dict)
-    _step_ms: list[float] = field(default_factory=list)
+Profiler = types.SimpleNamespace()
 
-    def add_ms(self, metric: str, elapsed_ms: float) -> None:
-        self._totals_ms[metric] = self._totals_ms.get(metric, 0.0) + float(elapsed_ms)
+def init_profiler(device, num_preallocated_events: int = 10) -> None:
+    _torch_gpu = torch_gpu(device)
+    if _torch_gpu is not None:
+        # Pre-allocate events to avoid overhead during profiling
+        Profiler.preallocated_events = []
+        for i in range(num_preallocated_events):
+            Profiler.preallocated_events.append(_torch_gpu.Event(enable_timing=True))
+        
+    Profiler.start_events = {}
+    Profiler.end_events = {}
+    Profiler.start_times = {}
+    Profiler.end_times = {}
 
-    def record_transformer_step(self, elapsed_ms: float) -> None:
-        value = float(elapsed_ms)
-        self._step_ms.append(value)
-        self.add_ms(METRIC_TRANSFORMER_STEP, value)
+def create_event(device) -> torch.cuda.Event | torch.xpu.Event | None:
+    _torch_gpu = torch_gpu(device)
+    if _torch_gpu is not None and hasattr(Profiler, "preallocated_events") and Profiler.preallocated_events:
+        if len(Profiler.preallocated_events) > 0:
+            event = Profiler.preallocated_events.pop()
+        else:
+            event = _torch_gpu.Event(enable_timing=True)
+            print("Warning: No preallocated events available, creating a new event which may introduce overhead.")
+    elif _torch_gpu is not None:
+        event = _torch_gpu.Event(enable_timing=True)
+        print("Warning: Preallocated events not initialized, creating a new event which may introduce overhead.")
+    return event
 
-    def sync(self, device: str | torch.device | None) -> None:
-        dtype = _device_type(device)
-        if dtype == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize()
-            return
-        if dtype == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.synchronize()
+def record_start(device, metric: str, stream=None) -> None:
+    _torch_gpu = torch_gpu(device)
+    if _torch_gpu is not None:
+        event = create_event(device)
+        if stream is not None:
+            event.record(stream)
+        else:
+            event.record()
+        Profiler.start_events[metric] = event
+    else: # fallback to high-resolution timer for CPU
+        Profiler.start_times[metric] = time.perf_counter()
 
-    def start_timer(self, device: str | torch.device | None, *, synchronize: bool = False) -> float:
-        if synchronize:
-            self.sync(device)
-        return time.perf_counter()
+def record_end(device, metric: str, stream=None) -> None:
+    _torch_gpu = torch_gpu(device)
+    if _torch_gpu is not None:
+        event = create_event(device)
+        if stream is not None:
+            event.record(stream)
+        else:
+            event.record()
+        Profiler.end_events[metric] = event
+    else: # fallback to high-resolution timer for CPU
+        Profiler.end_times[metric] = time.perf_counter()
 
-    def end_timer(
-        self,
-        metric: str,
-        started: float,
-        device: str | torch.device | None,
-        *,
-        synchronize: bool = False,
-    ) -> None:
-        if synchronize:
-            self.sync(device)
-        self.add_ms(metric, (time.perf_counter() - started) * 1000.0)
+def summary(device) -> dict[str, float]:
+    _torch_gpu = torch_gpu(device)
+    # if _torch_gpu is not None:        # Ensure all events are recorded
+    #     for event in list(Profiler.start_events.values()) + list(Profiler.end_events.values()):
+    #         event.synchronize()
 
-    def summary(self) -> dict[str, Any]:
-        transformer_total = self._totals_ms.get(METRIC_TRANSFORMER_STEP, 0.0)
-        step_count = len(self._step_ms)
-
-        def _row(label: str, key: str) -> dict[str, float | str]:
-            total_ms = self._totals_ms.get(key, 0.0)
-            percent = (100.0 * total_ms / transformer_total) if transformer_total > 0 else 0.0
-            avg_ms = (total_ms / step_count) if step_count > 0 else 0.0
-            return {
-                "component": label,
-                "total_ms": total_ms,
-                "percent_of_transformer": percent,
-                "avg_ms_per_step": avg_ms,
-            }
-
-        return {
-            "metadata": dict(self.metadata),
-            "step_count": step_count,
-            "step_transformer_ms": list(self._step_ms),
-            "totals_ms": dict(self._totals_ms),
-            "rows": [
-                _row("Transformer total", METRIC_TRANSFORMER_STEP),
-                _row("FFN total", METRIC_FFN_BLOCK),
-                _row("Attention blocks total", METRIC_ATTN_BLOCK),
-                _row("Block copy total (CPU->device)", METRIC_BLOCK_COPY),
-            ],
-        }
+    summary = {}
+    for metric in Profiler.start_events:
+        if metric in Profiler.end_events:
+            start_event = Profiler.start_events[metric]
+            end_event = Profiler.end_events[metric]
+            end_event.synchronize()
+            summary[metric] = start_event.elapsed_time(end_event)
+    for metric in Profiler.start_times:
+        if metric in Profiler.end_times:
+            start_time = Profiler.start_times[metric]
+            end_time = Profiler.end_times[metric]
+            summary[metric] = (end_time - start_time) * 1000  # Convert to milliseconds
+    return summary

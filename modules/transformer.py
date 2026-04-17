@@ -24,7 +24,6 @@
 import contextlib
 import math
 from dataclasses import dataclass
-from typing import Any
 from copy import deepcopy
 
 import torch
@@ -466,8 +465,8 @@ class ZImageTransformer2DModel(nn.Module):
         self.block_offload = False
         self._offload_exec_device = torch.device("cpu")
         self._offload_main_workers: nn.ModuleList | None = None  # 2 slots for double-buffer
-        self._offload_noise_worker: nn.Module | None = None
-        self._offload_context_worker: nn.Module | None = None
+        self._offload_cpu_param_refs: dict[int, dict[str, nn.Parameter]] = {}
+        self._offload_cpu_buffer_refs: dict[int, dict[str, torch.Tensor]] = {}
         self._copy_stream = None  # dedicated H2D copy stream
 
     @property
@@ -493,8 +492,8 @@ class ZImageTransformer2DModel(nn.Module):
         self.block_offload = False
         self._offload_exec_device = torch.device("cpu")
         self._offload_main_workers = None
-        self._offload_noise_worker = None
-        self._offload_context_worker = None
+        self._offload_cpu_param_refs = {}
+        self._offload_cpu_buffer_refs = {}
         self._copy_stream = None
 
     @staticmethod
@@ -505,23 +504,74 @@ class ZImageTransformer2DModel(nn.Module):
             for dst_b, src_b in zip(dst.buffers(), src.buffers()):
                 dst_b.copy_(src_b, non_blocking=True)
 
+    @staticmethod
+    def _module_device(module: nn.Module | None) -> torch.device | None:
+        if module is None:
+            return None
+        try:
+            return next(module.parameters()).device
+        except StopIteration:
+            return None
+
+    @staticmethod
+    def _qualified_name(module_name: str, leaf_name: str) -> str:
+        return f"{module_name}.{leaf_name}" if module_name else leaf_name
+
+    def _capture_cpu_refs(self, module: nn.Module) -> tuple[dict[str, nn.Parameter], dict[str, torch.Tensor]]:
+        param_refs: dict[str, nn.Parameter] = {}
+        buffer_refs: dict[str, torch.Tensor] = {}
+
+        for module_name, submodule in module.named_modules():
+            for param_name, param in submodule.named_parameters(recurse=False):
+                param_refs[self._qualified_name(module_name, param_name)] = param
+            for buffer_name, buffer in submodule.named_buffers(recurse=False):
+                buffer_refs[self._qualified_name(module_name, buffer_name)] = buffer
+
+        return param_refs, buffer_refs
+
+    def _get_cpu_refs(self, module: nn.Module) -> tuple[dict[str, nn.Parameter], dict[str, torch.Tensor]]:
+        module_id = id(module)
+        param_refs = self._offload_cpu_param_refs.get(module_id)
+        buffer_refs = self._offload_cpu_buffer_refs.get(module_id)
+        if param_refs is None or buffer_refs is None:
+            param_refs, buffer_refs = self._capture_cpu_refs(module)
+            self._offload_cpu_param_refs[module_id] = param_refs
+            self._offload_cpu_buffer_refs[module_id] = buffer_refs
+        return param_refs, buffer_refs
+
+    def _restore_cpu_refs(
+        self,
+        module: nn.Module,
+        param_refs: dict[str, nn.Parameter],
+        buffer_refs: dict[str, torch.Tensor],
+    ) -> None:
+        for module_name, submodule in module.named_modules():
+            for param_name, _ in list(submodule.named_parameters(recurse=False)):
+                key = self._qualified_name(module_name, param_name)
+                if key in param_refs:
+                    setattr(submodule, param_name, param_refs[key])
+            for buffer_name, _ in list(submodule.named_buffers(recurse=False)):
+                key = self._qualified_name(module_name, buffer_name)
+                if key in buffer_refs:
+                    setattr(submodule, buffer_name, buffer_refs[key])
+
+    def _run_module_with_attr_swap(self, module: nn.Module, *args, **kwargs):
+        param_refs, buffer_refs = self._get_cpu_refs(module)
+        module.to(device=self._offload_exec_device, dtype=self.dtype)
+        try:
+            return module(*args, **kwargs)
+        finally:
+            self._restore_cpu_refs(module, param_refs, buffer_refs)
+
     def _ensure_offload_workers(self) -> None:
         if not self.block_offload:
             return
-
-        def _module_device(module: nn.Module | None) -> torch.device | None:
-            if module is None:
-                return None
-            try:
-                return next(module.parameters()).device
-            except StopIteration:
-                return None
 
         # Always maintain exactly 2 device worker slots for double-buffer prefetch.
         recreate_main = (
             self._offload_main_workers is None
             or len(self._offload_main_workers) != 2
-            or _module_device(self._offload_main_workers[0]) != self._offload_exec_device
+            or self._module_device(self._offload_main_workers[0]) != self._offload_exec_device
         )
         if recreate_main and len(self.layers) > 0:
             worker_template = deepcopy(self.layers[0]).to(
@@ -530,24 +580,6 @@ class ZImageTransformer2DModel(nn.Module):
             )
             self._offload_main_workers = nn.ModuleList(
                 [deepcopy(worker_template), deepcopy(worker_template)]
-            )
-
-        if (
-            (self._offload_noise_worker is None or _module_device(self._offload_noise_worker) != self._offload_exec_device)
-            and len(self.noise_refiner) > 0
-        ):
-            self._offload_noise_worker = deepcopy(self.noise_refiner[0]).to(
-                device=self._offload_exec_device,
-                dtype=self.dtype,
-            )
-
-        if (
-            (self._offload_context_worker is None or _module_device(self._offload_context_worker) != self._offload_exec_device)
-            and len(self.context_refiner) > 0
-        ):
-            self._offload_context_worker = deepcopy(self.context_refiner[0]).to(
-                device=self._offload_exec_device,
-                dtype=self.dtype,
             )
 
     def _get_copy_stream(self):
@@ -562,21 +594,6 @@ class ZImageTransformer2DModel(nn.Module):
         else:
             self._copy_stream = None
         return self._copy_stream
-
-    def _run_module(
-        self,
-        module: nn.Module,
-        *args: Any,
-        force_no_offload: bool = False,
-        **kwargs: Any,
-    ):
-        if not self.block_offload or force_no_offload:
-            return module(*args, **kwargs)
-
-        module = module.to(device=self._offload_exec_device, dtype=self.dtype)
-        out = module(*args, **kwargs)
-        module.to(device="cpu")
-        return out
 
     # ── Patchify helpers ──────────────────────────────────────────────────────
 
@@ -746,11 +763,13 @@ class ZImageTransformer2DModel(nn.Module):
         offload_active = use_block_offload and self.block_offload
 
         # Timestep embedding (basic mode: single adaln per sample)
-        adaln_input = self._run_module(
-            self.t_embedder,
-            t * self.t_scale,
-            force_no_offload=not use_block_offload,
-        ).type_as(x[0])
+        if offload_active:
+            adaln_input = self._run_module_with_attr_swap(
+                self.t_embedder,
+                t * self.t_scale,
+            ).type_as(x[0])
+        else:
+            adaln_input = self.t_embedder(t * self.t_scale).type_as(x[0])
 
         # Patchify
         x, cap_feats, x_size, x_pos_ids, cap_pos_ids, x_pad_mask, cap_pad_mask = (
@@ -759,39 +778,37 @@ class ZImageTransformer2DModel(nn.Module):
 
         # Image tokens: embed → refine
         x_seqlens = [len(xi) for xi in x]
-        x = self._run_module(
-            self.all_x_embedder[key],
-            torch.cat(x, dim=0),
-            force_no_offload=not use_block_offload,
-        )
+        if offload_active:
+            x = self._run_module_with_attr_swap(
+                self.all_x_embedder[key],
+                torch.cat(x, dim=0),
+            )
+        else:
+            x = self.all_x_embedder[key](torch.cat(x, dim=0))
         x, x_freqs, x_mask, _, _ = self._prepare_sequence(
             list(x.split(x_seqlens, dim=0)), x_pos_ids, x_pad_mask, self.x_pad_token, device=device
         )
         for layer in self.noise_refiner:
             if offload_active:
-                if self._offload_noise_worker is None:
-                    raise RuntimeError("Offload worker for noise refiner is not initialized")
-                self._copy_module_tensors_(self._offload_noise_worker, layer)
-                x = self._offload_noise_worker(x, x_mask, x_freqs, adaln_input)
+                x = self._run_module_with_attr_swap(layer, x, x_mask, x_freqs, adaln_input)
             else:
                 x = layer(x, x_mask, x_freqs, adaln_input)
 
         # Caption tokens: embed → refine
         cap_seqlens = [len(ci) for ci in cap_feats]
-        cap_feats = self._run_module(
-            self.cap_embedder,
-            torch.cat(cap_feats, dim=0),
-            force_no_offload=not use_block_offload,
-        )
+        if offload_active:
+            cap_feats = self._run_module_with_attr_swap(
+                self.cap_embedder,
+                torch.cat(cap_feats, dim=0),
+            )
+        else:
+            cap_feats = self.cap_embedder(torch.cat(cap_feats, dim=0))
         cap_feats, cap_freqs, cap_mask, _, _ = self._prepare_sequence(
             list(cap_feats.split(cap_seqlens, dim=0)), cap_pos_ids, cap_pad_mask, self.cap_pad_token, device=device
         )
         for layer in self.context_refiner:
             if offload_active:
-                if self._offload_context_worker is None:
-                    raise RuntimeError("Offload worker for context refiner is not initialized")
-                self._copy_module_tensors_(self._offload_context_worker, layer)
-                cap_feats = self._offload_context_worker(cap_feats, cap_mask, cap_freqs)
+                cap_feats = self._run_module_with_attr_swap(layer, cap_feats, cap_mask, cap_freqs)
             else:
                 cap_feats = layer(cap_feats, cap_mask, cap_freqs)
 
@@ -880,12 +897,10 @@ class ZImageTransformer2DModel(nn.Module):
                     unified = unified + controlnet_block_samples[idx]
 
         # Final projection
-        unified = self._run_module(
-            self.all_final_layer[key],
-            unified,
-            c=adaln_input,
-            force_no_offload=not use_block_offload,
-        )
+        if offload_active:
+            unified = self._run_module_with_attr_swap(self.all_final_layer[key], unified, c=adaln_input)
+        else:
+            unified = self.all_final_layer[key](unified, c=adaln_input)
 
         # Unpatchify
         x = self.unpatchify(list(unified.unbind(dim=0)), x_size, patch_size, f_patch_size)
