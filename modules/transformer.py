@@ -38,6 +38,7 @@ ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 X_PAD_DIM = 64
 ENABLE_ASYNC_OFFLOAD_PREFETCH = True  # Temporary benchmark toggle.
+ENABLE_PINNED_OFFLOAD_WEIGHTS = True  # Pin CPU master weights to speed up H2D copies.
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -468,6 +469,7 @@ class ZImageTransformer2DModel(nn.Module):
         self._offload_cpu_param_refs: dict[int, dict[str, nn.Parameter]] = {}
         self._offload_cpu_buffer_refs: dict[int, dict[str, torch.Tensor]] = {}
         self._copy_stream = None  # dedicated H2D copy stream
+        self._offload_main_weights_pinned = False
 
     @property
     def dtype(self) -> torch.dtype:
@@ -486,6 +488,7 @@ class ZImageTransformer2DModel(nn.Module):
         self.block_offload = True
         self._offload_exec_device = torch.device(execution_device)
         self._copy_stream = None  # reset; will be created lazily in forward
+        self._pin_main_layer_weights_if_needed()
         self._ensure_offload_workers()
 
     def disable_block_offload(self) -> None:
@@ -495,6 +498,53 @@ class ZImageTransformer2DModel(nn.Module):
         self._offload_cpu_param_refs = {}
         self._offload_cpu_buffer_refs = {}
         self._copy_stream = None
+        self._offload_main_weights_pinned = False
+
+    @staticmethod
+    def _try_pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type != "cpu" or tensor.is_pinned():
+            return tensor
+        try:
+            return tensor.pin_memory()
+        except RuntimeError:
+            # Some environments do not expose pinned host allocations.
+            return tensor
+
+    def _pin_module_cpu_tensors_(self, module: nn.Module) -> int:
+        """Pin parameters and buffers for a CPU module in-place."""
+        pinned_count = 0
+
+        for _, submodule in module.named_modules():
+            for param_name, param in list(submodule.named_parameters(recurse=False)):
+                pinned = self._try_pin_cpu_tensor(param.detach())
+                if pinned.data_ptr() != param.data_ptr():
+                    setattr(
+                        submodule,
+                        param_name,
+                        nn.Parameter(pinned, requires_grad=param.requires_grad),
+                    )
+                    pinned_count += 1
+
+            for buffer_name, buffer in list(submodule.named_buffers(recurse=False)):
+                pinned = self._try_pin_cpu_tensor(buffer.detach())
+                if pinned.data_ptr() != buffer.data_ptr():
+                    is_persistent = buffer_name not in submodule._non_persistent_buffers_set
+                    submodule.register_buffer(buffer_name, pinned, persistent=is_persistent)
+                    pinned_count += 1
+
+        return pinned_count
+
+    def _pin_main_layer_weights_if_needed(self) -> None:
+        if not ENABLE_PINNED_OFFLOAD_WEIGHTS:
+            return
+        if self._offload_main_weights_pinned:
+            return
+        if self._offload_exec_device.type not in {"cuda", "xpu"}:
+            return
+
+        for layer in self.layers:
+            self._pin_module_cpu_tensors_(layer)
+        self._offload_main_weights_pinned = True
 
     @staticmethod
     def _copy_module_tensors_(dst: nn.Module, src: nn.Module) -> None:
